@@ -1,4 +1,5 @@
-// The DocBoy reporter uses direct HRAM access to detect test results.
+// The DocBoy reporter uses low-level state to detect test results and visual test completion.
+#define GB_INTERNAL
 
 #include <errno.h>
 #include <limits.h>
@@ -7,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zlib.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -38,6 +40,7 @@ typedef enum {
 typedef struct {
     char *path;
     char *display_path;
+    char *reference_png_path;
     GB_model_t model;
     const char *boot_rom_name;
     bool has_result_marker;
@@ -56,7 +59,18 @@ typedef struct {
     unsigned timeout_frames;
 } options_t;
 
+typedef struct {
+    unsigned width;
+    unsigned height;
+    uint8_t *rgb;
+} png_image_t;
+
 static uint32_t bitmap[256 * 224];
+static const GB_palette_t docboy_dmg_palette = {{{0x10, 0x40, 0x00},
+                                                 {0x29, 0x55, 0x00},
+                                                 {0x4A, 0x69, 0x00},
+                                                 {0x83, 0x95, 0x00},
+                                                 {0x83, 0x95, 0x00}}};
 
 static void usage(const char *argv0)
 {
@@ -129,6 +143,55 @@ static char *path_join_replacing_extension(const char *directory, const char *re
     return ret;
 }
 
+static void remove_path_component(char *path, const char *component, char separator)
+{
+    size_t component_length = strlen(component);
+    size_t pattern_length = component_length + 1;
+    char pattern[64];
+
+    if (pattern_length >= sizeof(pattern)) {
+        return;
+    }
+
+    pattern[0] = separator;
+    memcpy(pattern + 1, component, component_length);
+    pattern[pattern_length] = 0;
+
+    char *component_start = strstr(path, pattern);
+    if (component_start) {
+        memmove(component_start, component_start + pattern_length, strlen(component_start + pattern_length) + 1);
+    }
+}
+
+static void remove_reference_visual_component(char *path)
+{
+    remove_path_component(path, "interactive_visual", '/');
+    remove_path_component(path, "visual", '/');
+    remove_path_component(path, "interactive_visual", '\\');
+    remove_path_component(path, "visual", '\\');
+}
+
+static bool path_exists(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return false;
+    }
+    fclose(file);
+    return true;
+}
+
+static char *reference_png_path_for_rom(const char *results_root, const char *variant_relative_path)
+{
+    char *ret = path_join_replacing_extension(results_root, variant_relative_path, ".png");
+    remove_reference_visual_component(ret);
+    if (!path_exists(ret)) {
+        free(ret);
+        return NULL;
+    }
+    return ret;
+}
+
 static bool has_suffix(const char *string, const char *suffix)
 {
     size_t string_length = strlen(string);
@@ -155,8 +218,8 @@ static int compare_rom_entries(const void *a, const void *b)
     return strcmp(entry_a->path, entry_b->path);
 }
 
-static void append_rom(rom_list_t *list, const char *path, const char *display_path, GB_model_t model, const char *boot_rom_name,
-                       bool has_result_marker)
+static void append_rom(rom_list_t *list, const char *path, const char *display_path, const char *reference_png_path,
+                       GB_model_t model, const char *boot_rom_name, bool has_result_marker)
 {
     if (list->count == list->capacity) {
         list->capacity = list->capacity? list->capacity * 2 : 256;
@@ -171,19 +234,22 @@ static void append_rom(rom_list_t *list, const char *path, const char *display_p
     list->entries[list->count++] = (rom_entry_t) {
         .path = xstrdup(path),
         .display_path = xstrdup(display_path),
+        .reference_png_path = reference_png_path ? xstrdup(reference_png_path) : NULL,
         .model = model,
         .boot_rom_name = boot_rom_name,
         .has_result_marker = has_result_marker,
     };
 }
 
-static bool source_has_result_marker(const char *path)
+static bool source_has_result_marker(const char *path, bool *found)
 {
     FILE *file = fopen(path, "r");
     if (!file) {
-        return true;
+        *found = false;
+        return false;
     }
 
+    *found = true;
     bool ret = false;
     char line[4096];
     while (fgets(line, sizeof(line), file)) {
@@ -201,6 +267,7 @@ static void free_rom_list(rom_list_t *list)
     for (size_t i = 0; i < list->count; i++) {
         free(list->entries[i].path);
         free(list->entries[i].display_path);
+        free(list->entries[i].reference_png_path);
     }
     free(list->entries);
 }
@@ -213,6 +280,7 @@ static bool is_directory_attributes(unsigned attributes)
 
 static int collect_roms_in_directory(rom_list_t *list, const char *directory, const char *display_root,
                                      const char *variant_root, const char *source_root,
+                                     const char *results_root,
                                      GB_model_t model, const char *boot_rom_name)
 {
     char *pattern = path_join(directory, "*");
@@ -231,7 +299,8 @@ static int collect_roms_in_directory(rom_list_t *list, const char *directory, co
 
         char *path = path_join(directory, data.name);
         if (is_directory_attributes(data.attrib)) {
-            if (collect_roms_in_directory(list, path, display_root, variant_root, source_root, model, boot_rom_name)) {
+            if (collect_roms_in_directory(list, path, display_root, variant_root, source_root, results_root,
+                                          model, boot_rom_name)) {
                 free(path);
                 _findclose(handle);
                 return -1;
@@ -247,7 +316,14 @@ static int collect_roms_in_directory(rom_list_t *list, const char *directory, co
                 variant_relative_path++;
             }
             char *source_path = path_join_replacing_extension(source_root, variant_relative_path, ".asm");
-            append_rom(list, path, display_path, model, boot_rom_name, source_has_result_marker(source_path));
+            char *reference_png_path = reference_png_path_for_rom(results_root, variant_relative_path);
+            bool source_found = false;
+            bool has_result_marker = source_has_result_marker(source_path, &source_found);
+            if (!source_found) {
+                has_result_marker = reference_png_path == NULL;
+            }
+            append_rom(list, path, display_path, reference_png_path, model, boot_rom_name, has_result_marker);
+            free(reference_png_path);
             free(source_path);
         }
         free(path);
@@ -259,6 +335,7 @@ static int collect_roms_in_directory(rom_list_t *list, const char *directory, co
 #else
 static int collect_roms_in_directory(rom_list_t *list, const char *directory, const char *display_root,
                                      const char *variant_root, const char *source_root,
+                                     const char *results_root,
                                      GB_model_t model, const char *boot_rom_name)
 {
     DIR *dir = opendir(directory);
@@ -281,7 +358,8 @@ static int collect_roms_in_directory(rom_list_t *list, const char *directory, co
         }
 
         if (S_ISDIR(stat_buffer.st_mode)) {
-            if (collect_roms_in_directory(list, path, display_root, variant_root, source_root, model, boot_rom_name)) {
+            if (collect_roms_in_directory(list, path, display_root, variant_root, source_root, results_root,
+                                          model, boot_rom_name)) {
                 free(path);
                 closedir(dir);
                 return -1;
@@ -297,7 +375,14 @@ static int collect_roms_in_directory(rom_list_t *list, const char *directory, co
                 variant_relative_path++;
             }
             char *source_path = path_join_replacing_extension(source_root, variant_relative_path, ".asm");
-            append_rom(list, path, display_path, model, boot_rom_name, source_has_result_marker(source_path));
+            char *reference_png_path = reference_png_path_for_rom(results_root, variant_relative_path);
+            bool source_found = false;
+            bool has_result_marker = source_has_result_marker(source_path, &source_found);
+            if (!source_found) {
+                has_result_marker = reference_png_path == NULL;
+            }
+            append_rom(list, path, display_path, reference_png_path, model, boot_rom_name, has_result_marker);
+            free(reference_png_path);
             free(source_path);
         }
         free(path);
@@ -323,14 +408,16 @@ static int collect_docboy_roms(rom_list_t *list, const char *docboy_root)
 
     char *roms_root = path_join(docboy_root, "roms");
     char *source_root = path_join(docboy_root, "source");
+    char *results_root = path_join(docboy_root, "results");
     for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
         char *variant_root = path_join(roms_root, variants[i].name);
         char *variant_source_root = path_join(source_root, variants[i].name);
-        if (collect_roms_in_directory(list, variant_root, roms_root, variant_root, variant_source_root,
+        if (collect_roms_in_directory(list, variant_root, roms_root, variant_root, variant_source_root, results_root,
                                       variants[i].model, variants[i].boot_rom_name)) {
             fprintf(stderr, "Failed to scan '%s': %s\n", variant_root, strerror(errno));
             free(variant_source_root);
             free(variant_root);
+            free(results_root);
             free(source_root);
             free(roms_root);
             return -1;
@@ -338,6 +425,7 @@ static int collect_docboy_roms(rom_list_t *list, const char *docboy_root)
         free(variant_source_root);
         free(variant_root);
     }
+    free(results_root);
     free(source_root);
     free(roms_root);
 
@@ -405,9 +493,254 @@ static void log_callback(GB_gameboy_t *gb, const char *string, GB_log_attributes
     (void) attributes;
 }
 
+static uint32_t read_be32(const uint8_t *data)
+{
+    return ((uint32_t) data[0] << 24) |
+           ((uint32_t) data[1] << 16) |
+           ((uint32_t) data[2] << 8) |
+           (uint32_t) data[3];
+}
+
+static bool append_buffer(uint8_t **buffer, size_t *size, const uint8_t *data, size_t data_size)
+{
+    uint8_t *new_buffer = realloc(*buffer, *size + data_size);
+    if (!new_buffer) {
+        return false;
+    }
+    memcpy(new_buffer + *size, data, data_size);
+    *buffer = new_buffer;
+    *size += data_size;
+    return true;
+}
+
+static bool read_file(const char *path, uint8_t **data, size_t *size)
+{
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return false;
+    }
+
+    if (fseek(file, 0, SEEK_END)) {
+        fclose(file);
+        return false;
+    }
+
+    long length = ftell(file);
+    if (length < 0) {
+        fclose(file);
+        return false;
+    }
+
+    rewind(file);
+    *data = xmalloc((size_t) length);
+    *size = (size_t) length;
+    if (fread(*data, 1, *size, file) != *size) {
+        free(*data);
+        *data = NULL;
+        *size = 0;
+        fclose(file);
+        return false;
+    }
+
+    fclose(file);
+    return true;
+}
+
+static uint8_t paeth_predictor(uint8_t a, uint8_t b, uint8_t c)
+{
+    int p = (int) a + (int) b - (int) c;
+    int pa = abs(p - (int) a);
+    int pb = abs(p - (int) b);
+    int pc = abs(p - (int) c);
+
+    if (pa <= pb && pa <= pc) {
+        return a;
+    }
+    if (pb <= pc) {
+        return b;
+    }
+    return c;
+}
+
+static bool decode_png_rgb(const uint8_t *png, size_t png_size, png_image_t *image)
+{
+    static const uint8_t png_signature[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    if (png_size < sizeof(png_signature) || memcmp(png, png_signature, sizeof(png_signature))) {
+        return false;
+    }
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint8_t bit_depth = 0;
+    uint8_t color_type = 0;
+    uint8_t *idat = NULL;
+    size_t idat_size = 0;
+
+    size_t offset = sizeof(png_signature);
+    while (offset + 12 <= png_size) {
+        uint32_t chunk_size = read_be32(png + offset);
+        offset += 4;
+        const uint8_t *chunk_type = png + offset;
+        offset += 4;
+
+        if (chunk_size > png_size - offset - 4) {
+            free(idat);
+            return false;
+        }
+
+        const uint8_t *chunk_data = png + offset;
+        offset += chunk_size + 4; /* Skip data and CRC */
+
+        if (!memcmp(chunk_type, "IHDR", 4)) {
+            if (chunk_size != 13) {
+                free(idat);
+                return false;
+            }
+            width = read_be32(chunk_data);
+            height = read_be32(chunk_data + 4);
+            bit_depth = chunk_data[8];
+            color_type = chunk_data[9];
+            if (chunk_data[10] != 0 || chunk_data[11] != 0 || chunk_data[12] != 0) {
+                free(idat);
+                return false;
+            }
+        }
+        else if (!memcmp(chunk_type, "IDAT", 4)) {
+            if (!append_buffer(&idat, &idat_size, chunk_data, chunk_size)) {
+                free(idat);
+                return false;
+            }
+        }
+        else if (!memcmp(chunk_type, "IEND", 4)) {
+            break;
+        }
+    }
+
+    if (!width || !height || bit_depth != 8 || color_type != 2 || !idat_size) {
+        free(idat);
+        return false;
+    }
+
+    if ((size_t) width > SIZE_MAX / 3 || (size_t) height > SIZE_MAX / (1 + (size_t) width * 3)) {
+        free(idat);
+        return false;
+    }
+
+    size_t stride = (size_t) width * 3;
+    size_t filtered_size = (stride + 1) * height;
+    uint8_t *filtered = xmalloc(filtered_size);
+    uLongf actual_filtered_size = filtered_size;
+    int zret = uncompress(filtered, &actual_filtered_size, idat, idat_size);
+    free(idat);
+    if (zret != Z_OK || actual_filtered_size != filtered_size) {
+        free(filtered);
+        return false;
+    }
+
+    uint8_t *rgb = xmalloc(stride * height);
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t *src = filtered + y * (stride + 1);
+        uint8_t filter = src[0];
+        src++;
+        uint8_t *dest = rgb + y * stride;
+        const uint8_t *previous = y ? dest - stride : NULL;
+
+        if (filter > 4) {
+            free(filtered);
+            free(rgb);
+            return false;
+        }
+
+        for (size_t x = 0; x < stride; x++) {
+            uint8_t left = x >= 3 ? dest[x - 3] : 0;
+            uint8_t up = previous ? previous[x] : 0;
+            uint8_t up_left = previous && x >= 3 ? previous[x - 3] : 0;
+
+            switch (filter) {
+                case 0: dest[x] = src[x]; break;
+                case 1: dest[x] = src[x] + left; break;
+                case 2: dest[x] = src[x] + up; break;
+                case 3: dest[x] = src[x] + ((uint16_t) left + up) / 2; break;
+                case 4: dest[x] = src[x] + paeth_predictor(left, up, up_left); break;
+            }
+        }
+    }
+
+    free(filtered);
+    image->width = width;
+    image->height = height;
+    image->rgb = rgb;
+    return true;
+}
+
+static bool load_png_rgb(const char *path, png_image_t *image)
+{
+    uint8_t *png = NULL;
+    size_t png_size = 0;
+    if (!read_file(path, &png, &png_size)) {
+        return false;
+    }
+
+    bool ret = decode_png_rgb(png, png_size, image);
+    free(png);
+    return ret;
+}
+
+static void free_png_image(png_image_t *image)
+{
+    free(image->rgb);
+    image->rgb = NULL;
+}
+
+static void bitmap_pixel_rgb(uint32_t pixel, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+#ifdef GB_BIG_ENDIAN
+    *r = pixel >> 0;
+    *g = pixel >> 8;
+    *b = pixel >> 16;
+#else
+    *r = pixel >> 24;
+    *g = pixel >> 16;
+    *b = pixel >> 8;
+#endif
+}
+
+static test_status_t compare_reference_png(GB_gameboy_t *gb, const char *reference_png_path)
+{
+    png_image_t expected = {0};
+    if (!load_png_rgb(reference_png_path, &expected)) {
+        fprintf(stderr, "Failed to load reference PNG '%s'\n", reference_png_path);
+        return TEST_ERROR;
+    }
+
+    unsigned width = GB_get_screen_width(gb);
+    unsigned height = GB_get_screen_height(gb);
+    if (expected.width != width || expected.height != height) {
+        fprintf(stderr, "Reference PNG '%s' has size %ux%u, expected %ux%u\n",
+                reference_png_path, expected.width, expected.height, width, height);
+        free_png_image(&expected);
+        return TEST_FAIL;
+    }
+
+    for (unsigned y = 0; y < height; y++) {
+        for (unsigned x = 0; x < width; x++) {
+            uint8_t actual_r, actual_g, actual_b;
+            bitmap_pixel_rgb(bitmap[y * width + x], &actual_r, &actual_g, &actual_b);
+            uint8_t *expected_pixel = expected.rgb + (y * width + x) * 3;
+            if (actual_r != expected_pixel[0] || actual_g != expected_pixel[1] || actual_b != expected_pixel[2]) {
+                free_png_image(&expected);
+                return TEST_FAIL;
+            }
+        }
+    }
+
+    free_png_image(&expected);
+    return TEST_PASS;
+}
+
 static test_status_t run_rom(const rom_entry_t *rom, const options_t *options)
 {
-    if (!rom->has_result_marker) {
+    if (!rom->has_result_marker && !rom->reference_png_path) {
         return TEST_UNKNOWN;
     }
 
@@ -428,6 +761,9 @@ static test_status_t run_rom(const rom_entry_t *rom, const options_t *options)
 
     GB_set_pixels_output(gb, bitmap);
     GB_set_rgb_encode_callback(gb, rgb_encode);
+    if (!GB_is_cgb(gb)) {
+        GB_set_palette(gb, &docboy_dmg_palette);
+    }
     GB_set_log_callback(gb, log_callback);
     GB_set_color_correction_mode(gb, GB_COLOR_CORRECTION_EMULATE_HARDWARE);
     GB_set_rtc_mode(gb, GB_RTC_MODE_ACCURATE);
@@ -442,28 +778,33 @@ static test_status_t run_rom(const rom_entry_t *rom, const options_t *options)
         return TEST_ERROR;
     }
 
-    size_t hram_size = 0;
-    uint8_t *hram = GB_get_direct_access(gb, GB_DIRECT_ACCESS_HRAM, &hram_size, NULL);
-    if (!hram || hram_size <= DOCBOY_RESULT_HRAM_OFFSET) {
-        GB_free(gb);
-        GB_dealloc(gb);
-        return TEST_ERROR;
-    }
+    uint8_t *hram = NULL;
+    if (rom->has_result_marker) {
+        size_t hram_size = 0;
+        hram = GB_get_direct_access(gb, GB_DIRECT_ACCESS_HRAM, &hram_size, NULL);
+        if (!hram || hram_size <= DOCBOY_RESULT_HRAM_OFFSET) {
+            GB_free(gb);
+            GB_dealloc(gb);
+            return TEST_ERROR;
+        }
 
-    hram[DOCBOY_RESULT_HRAM_OFFSET] = 0;
+        hram[DOCBOY_RESULT_HRAM_OFFSET] = 0;
+    }
 
     test_status_t result = TEST_UNKNOWN;
     unsigned frames = 0;
     unsigned cycles = 0;
     while (frames < options->timeout_frames) {
-        uint8_t marker = hram[DOCBOY_RESULT_HRAM_OFFSET];
-        if (marker == 1) {
-            result = TEST_PASS;
-            break;
-        }
-        if (marker == 2) {
-            result = TEST_FAIL;
-            break;
+        if (rom->has_result_marker) {
+            uint8_t marker = hram[DOCBOY_RESULT_HRAM_OFFSET];
+            if (marker == 1) {
+                result = TEST_PASS;
+                break;
+            }
+            if (marker == 2) {
+                result = TEST_FAIL;
+                break;
+            }
         }
 
         cycles += GB_run(gb);
@@ -471,6 +812,14 @@ static test_status_t run_rom(const rom_entry_t *rom, const options_t *options)
             frames++;
             cycles -= CYCLES_PER_FRAME;
         }
+
+        if (!rom->has_result_marker && gb->halted && !gb->interrupt_enable && gb->speed_switch_halt_countdown == 0) {
+            break;
+        }
+    }
+
+    if (result == TEST_UNKNOWN && rom->reference_png_path) {
+        result = compare_reference_png(gb, rom->reference_png_path);
     }
 
     GB_free(gb);

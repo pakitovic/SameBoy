@@ -740,7 +740,7 @@ $(BIN)/tester/sameboy_tester.exe: $(CORE_OBJECTS) $(TESTER_OBJECTS)
 
 $(BIN)/tester/sameboy_docboy_report: $(CORE_OBJECTS) $(DOCBOY_REPORTER_OBJECTS)
 	-@$(MKDIR) -p $(dir $@)
-	$(CC) $^ -o $@ $(LDFLAGS)
+	$(CC) $^ -o $@ $(LDFLAGS) $(DOCBOY_REPORTER_LDFLAGS)
 ifeq ($(CONF), release)
 	$(STRIP) $@
 	$(CODESIGN) $@
@@ -748,11 +748,12 @@ endif
 
 $(BIN)/tester/sameboy_docboy_report.exe: $(CORE_OBJECTS) $(DOCBOY_REPORTER_OBJECTS)
 	-@$(MKDIR) -p $(dir $@)
-	$(CC) $^ -o $@ $(LDFLAGS) -Wl,/subsystem:console
+	$(CC) $^ -o $@ $(LDFLAGS) $(DOCBOY_REPORTER_LDFLAGS) -Wl,/subsystem:console
 
 DOCBOY_TIMEOUT_FRAMES ?= 3600
 DOCBOY_BOOTROM_DIR ?= $(BIN)/tester
 DOCBOY_BUILD ?= 1
+DOCBOY_REPORTER_LDFLAGS ?= -lz
 REPORT ?= docboy.md
 
 docboy-report: docboy_reporter
