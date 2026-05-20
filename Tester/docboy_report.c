@@ -181,15 +181,16 @@ static bool path_exists(const char *path)
     return true;
 }
 
-static char *reference_png_path_for_rom(const char *results_root, const char *variant_relative_path)
+static char *reference_png_path_for_rom(const char *results_root, const char *display_path)
 {
-    char *ret = path_join_replacing_extension(results_root, variant_relative_path, ".png");
+    char *ret = path_join_replacing_extension(results_root, display_path, ".png");
     remove_reference_visual_component(ret);
-    if (!path_exists(ret)) {
-        free(ret);
-        return NULL;
+    if (path_exists(ret)) {
+        return ret;
     }
-    return ret;
+
+    free(ret);
+    return NULL;
 }
 
 static bool has_suffix(const char *string, const char *suffix)
@@ -316,7 +317,7 @@ static int collect_roms_in_directory(rom_list_t *list, const char *directory, co
                 variant_relative_path++;
             }
             char *source_path = path_join_replacing_extension(source_root, variant_relative_path, ".asm");
-            char *reference_png_path = reference_png_path_for_rom(results_root, variant_relative_path);
+            char *reference_png_path = reference_png_path_for_rom(results_root, display_path);
             bool source_found = false;
             bool has_result_marker = source_has_result_marker(source_path, &source_found);
             if (!source_found) {
@@ -375,7 +376,7 @@ static int collect_roms_in_directory(rom_list_t *list, const char *directory, co
                 variant_relative_path++;
             }
             char *source_path = path_join_replacing_extension(source_root, variant_relative_path, ".asm");
-            char *reference_png_path = reference_png_path_for_rom(results_root, variant_relative_path);
+            char *reference_png_path = reference_png_path_for_rom(results_root, display_path);
             bool source_found = false;
             bool has_result_marker = source_has_result_marker(source_path, &source_found);
             if (!source_found) {
