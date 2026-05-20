@@ -65,6 +65,11 @@ typedef struct {
     uint8_t *rgb;
 } png_image_t;
 
+typedef struct {
+    bool pressed;
+    bool released;
+} input_state_t;
+
 static uint32_t bitmap[256 * 224];
 static const GB_palette_t docboy_dmg_palette = {{{0x10, 0x40, 0x00},
                                                  {0x29, 0x55, 0x00},
@@ -115,7 +120,8 @@ static char *path_join(const char *a, const char *b)
     return ret;
 }
 
-static char *path_join_replacing_extension(const char *directory, const char *relative_path, const char *extension)
+static char *path_join_replacing_extension_with_suffix(const char *directory, const char *relative_path,
+                                                       const char *suffix, const char *extension)
 {
     size_t relative_length = strlen(relative_path);
     size_t stem_length = relative_length;
@@ -130,17 +136,24 @@ static char *path_join_replacing_extension(const char *directory, const char *re
     }
 
     size_t directory_length = strlen(directory);
+    size_t suffix_length = strlen(suffix);
     size_t extension_length = strlen(extension);
     bool add_separator = directory_length && directory[directory_length - 1] != '/' && directory[directory_length - 1] != '\\';
-    char *ret = xmalloc(directory_length + add_separator + stem_length + extension_length + 1);
+    char *ret = xmalloc(directory_length + add_separator + stem_length + suffix_length + extension_length + 1);
     memcpy(ret, directory, directory_length);
     if (add_separator) {
         ret[directory_length++] = '/';
     }
     memcpy(ret + directory_length, relative_path, stem_length);
-    memcpy(ret + directory_length + stem_length, extension, extension_length);
-    ret[directory_length + stem_length + extension_length] = 0;
+    memcpy(ret + directory_length + stem_length, suffix, suffix_length);
+    memcpy(ret + directory_length + stem_length + suffix_length, extension, extension_length);
+    ret[directory_length + stem_length + suffix_length + extension_length] = 0;
     return ret;
+}
+
+static char *path_join_replacing_extension(const char *directory, const char *relative_path, const char *extension)
+{
+    return path_join_replacing_extension_with_suffix(directory, relative_path, "", extension);
 }
 
 static void remove_path_component(char *path, const char *component, char separator)
@@ -181,6 +194,31 @@ static bool path_exists(const char *path)
     return true;
 }
 
+static const char *reference_png_suffix_for_rom(const char *display_path)
+{
+    if (!strstr(display_path, "/joypad/interactive_visual/")) {
+        return "";
+    }
+
+    if (strstr(display_path, "/joypad_buttons_dpad.")) {
+        return "_a_right";
+    }
+
+    if (strstr(display_path, "/joypad_buttons.")) {
+        return "_a";
+    }
+
+    if (strstr(display_path, "/joypad_dpad.")) {
+        return "_up";
+    }
+
+    if (strstr(display_path, "/joypad_none.")) {
+        return "_idle";
+    }
+
+    return "";
+}
+
 static char *reference_png_path_for_rom(const char *results_root, const char *display_path)
 {
     char *ret = path_join_replacing_extension(results_root, display_path, ".png");
@@ -190,6 +228,17 @@ static char *reference_png_path_for_rom(const char *results_root, const char *di
     }
 
     free(ret);
+
+    const char *suffix = reference_png_suffix_for_rom(display_path);
+    if (*suffix) {
+        ret = path_join_replacing_extension_with_suffix(results_root, display_path, suffix, ".png");
+        remove_reference_visual_component(ret);
+        if (path_exists(ret)) {
+            return ret;
+        }
+        free(ret);
+    }
+
     return NULL;
 }
 
@@ -206,6 +255,11 @@ static bool has_suffix(const char *string, const char *suffix)
 static bool is_rom_path(const char *path)
 {
     return has_suffix(path, ".gb") || has_suffix(path, ".gbc");
+}
+
+static bool path_contains(const char *path, const char *substring)
+{
+    return strstr(path, substring) != NULL;
 }
 
 static int compare_rom_entries(const void *a, const void *b)
@@ -739,6 +793,116 @@ static test_status_t compare_reference_png(GB_gameboy_t *gb, const char *referen
     return TEST_PASS;
 }
 
+static void clear_automated_input(GB_gameboy_t *gb)
+{
+    GB_set_key_state(gb, GB_KEY_RIGHT, false);
+    GB_set_key_state(gb, GB_KEY_LEFT, false);
+    GB_set_key_state(gb, GB_KEY_UP, false);
+    GB_set_key_state(gb, GB_KEY_DOWN, false);
+    GB_set_key_state(gb, GB_KEY_A, false);
+    GB_set_key_state(gb, GB_KEY_B, false);
+    GB_set_key_state(gb, GB_KEY_SELECT, false);
+    GB_set_key_state(gb, GB_KEY_START, false);
+}
+
+static bool joypad_interactive_uses_dpad(const char *path)
+{
+    return path_contains(path, "buttons_dpad_interrupt") ||
+           path_contains(path, "dpad_dpad_interrupt") ||
+           path_contains(path, "dpad_interrupt_release");
+}
+
+static void set_joypad_interactive_key(GB_gameboy_t *gb, const char *path, bool pressed)
+{
+    GB_set_key_state(gb, joypad_interactive_uses_dpad(path) ? GB_KEY_UP : GB_KEY_A, pressed);
+}
+
+static void apply_joypad_visual_input(GB_gameboy_t *gb, const char *path)
+{
+    if (path_contains(path, "joypad_none")) {
+        return;
+    }
+
+    if (path_contains(path, "joypad_buttons_dpad")) {
+        GB_set_key_state(gb, GB_KEY_A, true);
+        GB_set_key_state(gb, GB_KEY_RIGHT, true);
+        return;
+    }
+
+    if (path_contains(path, "joypad_dpad")) {
+        GB_set_key_state(gb, GB_KEY_UP, true);
+    }
+
+    if (path_contains(path, "joypad_buttons")) {
+        GB_set_key_state(gb, GB_KEY_A, true);
+    }
+}
+
+static void apply_joypad_interactive_input(GB_gameboy_t *gb, const char *path, input_state_t *input)
+{
+    if (!path_contains(path, "/joypad/interactive/")) {
+        return;
+    }
+
+    if (!input->pressed && gb->pc < gb->rom_size && GB_read_memory(gb, gb->pc) == 0x40) { /* ld b, b */
+        input->pressed = true;
+    }
+
+    if (!input->released && gb->pc < gb->rom_size && GB_read_memory(gb, gb->pc) == 0x49) { /* ld c, c */
+        input->released = true;
+    }
+
+    if (input->pressed && !input->released) {
+        set_joypad_interactive_key(gb, path, true);
+    }
+}
+
+static bool stop_test_presses_before_stop(const char *path)
+{
+    return path_contains(path, "stop_joypad1") ||
+           path_contains(path, "_joypad1_") ||
+           path_contains(path, "stop_immediate_exit_joypad_interrupt");
+}
+
+static bool stop_test_exits_after_stop(const char *path)
+{
+    return path_contains(path, "/interactive/") &&
+           (path_contains(path, "/stop_") || path_contains(path, "_stop_"));
+}
+
+static void apply_stop_interactive_input(GB_gameboy_t *gb, const char *path, input_state_t *input)
+{
+    if (stop_test_presses_before_stop(path)) {
+        input->pressed = true;
+    }
+
+    if (stop_test_exits_after_stop(path) && gb->stopped) {
+        input->pressed = true;
+    }
+
+    if (input->pressed) {
+        GB_set_key_state(gb, GB_KEY_UP, true);
+    }
+}
+
+static void apply_automated_input(GB_gameboy_t *gb, const rom_entry_t *rom, input_state_t *input)
+{
+    clear_automated_input(gb);
+
+    if (!gb->boot_rom_finished) {
+        return;
+    }
+
+    apply_joypad_visual_input(gb, rom->display_path);
+    apply_joypad_interactive_input(gb, rom->display_path, input);
+    apply_stop_interactive_input(gb, rom->display_path, input);
+}
+
+static bool visual_test_needs_halt_grace(const char *path)
+{
+    return path_contains(path, "/joypad/interactive_visual/");
+}
+
 static test_status_t run_rom(const rom_entry_t *rom, const options_t *options)
 {
     if (!rom->has_result_marker && !rom->reference_png_path) {
@@ -793,9 +957,13 @@ static test_status_t run_rom(const rom_entry_t *rom, const options_t *options)
     }
 
     test_status_t result = TEST_UNKNOWN;
+    input_state_t input = {0};
     unsigned frames = 0;
+    unsigned visual_halt_frame = UINT_MAX;
     unsigned cycles = 0;
     while (frames < options->timeout_frames) {
+        apply_automated_input(gb, rom, &input);
+
         if (rom->has_result_marker) {
             uint8_t marker = hram[DOCBOY_RESULT_HRAM_OFFSET];
             if (marker == 1) {
@@ -815,7 +983,18 @@ static test_status_t run_rom(const rom_entry_t *rom, const options_t *options)
         }
 
         if (!rom->has_result_marker && gb->halted && !gb->interrupt_enable && gb->speed_switch_halt_countdown == 0) {
-            break;
+            if (!rom->reference_png_path) {
+                break;
+            }
+            if (!visual_test_needs_halt_grace(rom->display_path)) {
+                break;
+            }
+            if (visual_halt_frame == UINT_MAX) {
+                visual_halt_frame = frames;
+            }
+            if (frames - visual_halt_frame >= 3) {
+                break;
+            }
         }
     }
 
