@@ -59,6 +59,17 @@ ifeq ($(MAKECMDGOALS),)
 MAKECMDGOALS := $(DEFAULT)
 endif
 
+# bsnes preset (BSNES=1): configure the Core build exactly as bsnes compiles it
+# internally (see bsnes/gb/GNUmakefile) — release config, debugger and cheat engines
+# disabled, and workboy.c dropped, leaving the same 15-file source subset and the same
+# flags bsnes uses. Must come before the DISABLE_* blocks below so they take effect.
+ifneq ($(BSNES),)
+DISABLE_DEBUGGER := 1
+DISABLE_CHEATS := 1
+CORE_FILTER += Core/workboy.c
+CONF := release
+endif
+
 ifneq ($(DISABLE_TIMEKEEPING),)
 CFLAGS += -DGB_DISABLE_TIMEKEEPING
 CPPP_FLAGS += -DGB_DISABLE_TIMEKEEPING
@@ -913,9 +924,16 @@ $(LIBDIR)/libsameboy.a: $(LIBDIR)/libsameboy.o
 	-@rm -f $@
 	ar -crs $@ $^
 	
-$(LIBDIR)/libsameboy.$(DL_EXT): $(CORE_OBJECTS)
+# The Darwin link flags add -Wl,-exported_symbols_list,/dev/null to hide every symbol from
+# the standalone executables; that empty export list must NOT apply to the shared library.
+COMMA := ,
+$(LIBDIR)/libsameboy.$(DL_EXT): $(LIBDIR)/libsameboy.o
 	-@$(MKDIR) -p $(dir $@)
-	$(CC) $(LDFLAGS) -shared $(FAT_FLAGS) $(CFLAGS) $^ -o $@
+	@# Link from the native libsameboy.o (LTO already resolved by the hack above), and drop
+	@# the executables' empty -exported_symbols_list (/dev/null on Darwin) so the GB_* API
+	@# is actually exported instead of producing a symbol-less library. On Linux/Windows the
+	@# flag isn't present (Windows uses its own exports.def), so the filter is a no-op there.
+	$(CC) $(filter-out -Wl$(COMMA)-exported_symbols_list$(COMMA)$(NULL),$(LDFLAGS)) -shared $(FAT_FLAGS) $(filter-out -flto,$(CFLAGS)) $^ -o $@
 ifeq ($(CONF), release)
 	$(STRIP) $@
 	$(CODESIGN) $@
