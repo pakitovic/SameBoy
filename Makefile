@@ -60,9 +60,20 @@ MAKECMDGOALS := $(DEFAULT)
 endif
 
 # bsnes preset (BSNES=1): configure the Core build exactly as bsnes compiles it
-# internally (see bsnes/gb/GNUmakefile) — release config, debugger and cheat engines
-# disabled, and workboy.c dropped, leaving the same 15-file source subset and the same
-# flags bsnes uses. Must come before the DISABLE_* blocks below so they take effect.
+# internally — release config, debugger and cheat engines disabled, and workboy.c
+# dropped, leaving the same 15-file source subset and the same flags bsnes uses.
+# Must come before the DISABLE_* blocks below so they take effect.
+#
+# Native build (static + shared libraries and headers under build/):
+#   make lib BSNES=1
+#
+# Cross-build of the static library alone (e.g. for bsnes' Android libretro core);
+# requesting the .a directly skips the shared library and its host-specific tooling,
+# and PLATFORM= keeps the host's (e.g. Darwin's) compiler flags out of the build:
+#   TC=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin
+#   make build-android/lib/libsameboy.a BSNES=1 PLATFORM=Android \
+#        CC=$TC/aarch64-linux-android24-clang AR=$TC/llvm-ar \
+#        LIBDIR=build-android/lib OBJ=build-android/obj
 ifneq ($(BSNES),)
 DISABLE_DEBUGGER := 1
 DISABLE_CHEATS := 1
@@ -146,6 +157,7 @@ CC := clang
 endif
 endif
 
+AR ?= ar
 IBTOOL ?= ibtool
 
 # Find libraries with pkg-config if available.
@@ -922,7 +934,7 @@ $(LIBDIR)/libsameboy.o: $(CORE_OBJECTS)
 $(LIBDIR)/libsameboy.a: $(LIBDIR)/libsameboy.o
 	-@$(MKDIR) -p $(dir $@)
 	-@rm -f $@
-	ar -crs $@ $^
+	$(AR) -crs $@ $^
 	
 # The Darwin link flags add -Wl,-exported_symbols_list,/dev/null to hide every symbol from
 # the standalone executables; that empty export list must NOT apply to the shared library.
